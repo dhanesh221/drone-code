@@ -1,0 +1,242 @@
+import cv2
+from pymavlink import mavutil
+from ultralytics import YOLO
+import threading
+import time
+import math
+import os
+import numpy as np
+from datetime import datetime
+import folium
+from folium.plugins import MarkerCluster
+
+# === CONFIG ===
+connection_string = '/dev/ttyACM0'
+RTSP_STREAM_URL = "rtsp://192.168.144.25:8554/main.264"
+MODEL_PATH = "/home/sherlock/best.pt"
+CONFIDENCE_THRESHOLD = 0.5
+INFERENCE_SKIP = 1  # Run inference every frame. Change to 2 or more to skip frames
+
+# Camera Specs
+CAMERA_HORIZONTAL_FOV_DEG = 80
+FPS = 30
+# ==============
+
+model = YOLO(MODEL_PATH)
+class_names = model.names
+print("[INFO] Loaded model with classes:", class_names)
+
+telemetry_data = {'lat': None, 'lon': None, 'alt': None}
+telemetry_lock = threading.Lock()
+stop_flag = False
+detected_objects = []
+
+def telemetry_thread():
+    global telemetry_data, stop_flag
+    print("[DEBUG] Connecting to MAVLink on:", connection_string)
+    master = mavutil.mavlink_connection(connection_string)
+    master.wait_heartbeat()
+    print(f"[INFO] Heartbeat from system {master.target_system}, component {master.target_component}")
+
+    master.mav.request_data_stream_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_DATA_STREAM_ALL,
+        1,
+        1
+    )
+
+    while not stop_flag:
+        try:
+            msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+            if msg:
+                with telemetry_lock:
+                    telemetry_data['lat'] = msg.lat / 1e7
+                    telemetry_data['lon'] = msg.lon / 1e7
+                    telemetry_data['alt'] = msg.relative_alt / 1000
+        except Exception as e:
+            print("[ERROR] Telemetry thread:", e)
+        time.sleep(0.1)
+
+def pixel_to_gps(x_px, y_px, frame_w, frame_h, lat, lon, alt_m, fov_deg=80):
+    fov_rad = math.radians(fov_deg)
+    aspect_ratio = frame_h / frame_w
+
+    ground_width = 2 * alt_m * math.tan(fov_rad / 2)
+    ground_height = ground_width * aspect_ratio
+
+    mpp_x = ground_width / frame_w
+    mpp_y = ground_height / frame_h
+
+    dx = (x_px - frame_w / 2) * mpp_x
+    dy = (y_px - frame_h / 2) * mpp_y
+
+    delta_lat = dy / 111320
+    delta_lon = dx / (40075000 * math.cos(math.radians(lat)) / 360)
+
+    obj_lat = lat + delta_lat
+    obj_lon = lon + delta_lon
+
+    return obj_lat, obj_lon
+
+def main():
+    global stop_flag
+    thread = threading.Thread(target=telemetry_thread)
+    thread.start()
+
+    cap = cv2.VideoCapture(RTSP_STREAM_URL)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open RTSP stream at: {RTSP_STREAM_URL}")
+        stop_flag = True
+        thread.join()
+        return
+
+    # === Read first frame to get actual size ===
+    ret, frame = cap.read()
+    if not ret:
+        print("[ERROR] Failed to read first frame from RTSP.")
+        stop_flag = True
+        thread.join()
+        return
+
+    FRAME_HEIGHT, FRAME_WIDTH = frame.shape[:2]
+
+    # === Folder for saving screenshots ===
+    downloads_folder = os.path.join(os.path.expanduser("~"), "Downloads")
+    screenshots_folder = os.path.join(downloads_folder, "drone_screenshots")
+    os.makedirs(screenshots_folder, exist_ok=True)
+    print(f"[INFO] Screenshots will be saved to: {screenshots_folder}")
+
+    frame_count = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+
+            if not ret:
+                print("[WARNING] Failed to grab frame from RTSP. Attempting to reconnect...")
+
+                cap.release()
+                time.sleep(1)
+                cap = cv2.VideoCapture(RTSP_STREAM_URL)
+
+                retry_count = 0
+                while not cap.isOpened() and retry_count < 5:
+                    print(f"[INFO] Retry attempt {retry_count + 1} to connect RTSP...")
+                    time.sleep(2)
+                    cap = cv2.VideoCapture(RTSP_STREAM_URL)
+                    retry_count += 1
+
+                if not cap.isOpened():
+                    print("[ERROR] Reconnection failed. Skipping frame.")
+                    continue
+                else:
+                    print("[INFO] RTSP stream reconnected.")
+                    continue
+
+            if frame_count % INFERENCE_SKIP == 0:
+                results = model(frame)[0]
+
+                for box in results.boxes:
+                    conf = float(box.conf[0])
+                    if conf < CONFIDENCE_THRESHOLD:
+                        continue
+
+                    cls_id = int(box.cls[0])
+                    class_name = class_names[cls_id]
+                    print(f"[DEBUG] Detected: {class_name} ({conf:.2f})")  # debug
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    cv2.putText(frame, f"{class_name} ({conf:.2f})", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                    with telemetry_lock:
+                        lat = telemetry_data.get('lat')
+                        lon = telemetry_data.get('lon')
+                        alt = telemetry_data.get('alt')
+
+                    if lat is not None and lon is not None and alt is not None:
+                        obj_lat, obj_lon = pixel_to_gps(cx, cy, FRAME_WIDTH, FRAME_HEIGHT, lat, lon, alt,
+                                                        fov_deg=CAMERA_HORIZONTAL_FOV_DEG)
+                        gps_str = f"{class_name} at {obj_lat:.6f}, {obj_lon:.6f}"
+                        print("[OBJECT DETECTED]", gps_str)
+
+                        detected_objects.append({
+                            'class': class_name,
+                            'confidence': conf,
+                            'latitude': obj_lat,
+                            'longitude': obj_lon,
+                            'timestamp': datetime.now().strftime("%H:%M:%S")
+                        })
+
+                        cv2.putText(frame, f"GPS: {obj_lat:.6f}, {obj_lon:.6f}",
+                                    (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                        # === SAVE FRAME IF HUMAN DETECTED ===
+                        if class_name.lower() in ["person", "human"]:
+                            screenshot_time = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                            screenshot_name = f"{class_name}_{screenshot_time}_lat{obj_lat:.6f}_lon{obj_lon:.6f}_alt{alt:.1f}.jpg"
+                            screenshot_path = os.path.join(screenshots_folder, screenshot_name)
+
+                            success = cv2.imwrite(screenshot_path, frame)
+                            if success:
+                                print(f"[INFO] Saved {class_name} detection frame to: {screenshot_path}")
+                            else:
+                                print(f"[ERROR] Failed to save frame to: {screenshot_path}")
+
+            with telemetry_lock:
+                lat = telemetry_data.get('lat')
+                lon = telemetry_data.get('lon')
+                alt = telemetry_data.get('alt')
+
+            if lat is not None and lon is not None and alt is not None:
+                gps_text = f"Drone: Lat {lat:.6f}, Lon {lon:.6f}, Alt {alt:.1f} m"
+            else:
+                gps_text = "Waiting for GPS..."
+
+            cv2.putText(frame, gps_text, (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow("YOLOv8 + Telemetry (RTSP)", frame)
+
+            frame_count += 1
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("[INFO] Interrupted by user.")
+
+    finally:
+        stop_flag = True
+        thread.join()
+        cap.release()
+        cv2.destroyAllWindows()
+
+        # === Generate Map ===
+        if detected_objects:
+            first_obj = detected_objects[0]
+            fmap = folium.Map(location=[first_obj['latitude'], first_obj['longitude']], zoom_start=17)
+            marker_cluster = MarkerCluster().add_to(fmap)
+
+            for obj in detected_objects:
+                folium.Marker(
+                    location=[obj['latitude'], obj['longitude']],
+                    popup=f"{obj['class']} ({obj['confidence']:.2f}) at {obj['timestamp']}",
+                    icon=folium.Icon(color='blue', icon='info-sign')
+                ).add_to(marker_cluster)
+
+            map_path = os.path.join(screenshots_folder, f"drone_map_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.html")
+            fmap.save(map_path)
+            print("[INFO] Detection map saved to:", map_path)
+        else:
+            print("[INFO] No objects detected — map not created.")
+
+        print("[INFO] Clean exit.")
+
+if __name__ == "__main__":
+    main()
