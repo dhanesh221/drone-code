@@ -10,6 +10,8 @@ from datetime import datetime
 import folium
 from folium.plugins import MarkerCluster
 
+from object_tracker import ObjectTracker
+
 # === CONFIG ===
 connection_string = '/dev/ttyACM0'
 RTSP_STREAM_URL = "rtsp://192.168.144.25:8554/main.264"
@@ -34,7 +36,7 @@ telemetry_data = {
 
 telemetry_lock = threading.Lock()
 stop_flag = False
-detected_objects = []
+detected_objects = [[]]
 
 def telemetry_thread():
     global telemetry_data, stop_flag
@@ -133,6 +135,7 @@ def main():
     frame_count = 0
 
     try:
+        tracker = ObjectTracker(max_disappeared=5)
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -156,6 +159,14 @@ def main():
 
             if frame_count % INFERENCE_SKIP == 0:
                 results = model(frame)[0]
+                obj_lat_lons = []
+                centroids = []
+
+                with telemetry_lock:
+                    lat = telemetry_data.get('lat')
+                    lon = telemetry_data.get('lon')
+                    alt = telemetry_data.get('alt')
+                    pitch = telemetry_data.get('pitch')
 
                 for box in results.boxes:
                     conf = float(box.conf[0])
@@ -167,16 +178,12 @@ def main():
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
+                    centroids.append((cx,cy))
 
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                     cv2.putText(frame, f"{class_name} ({conf:.2f})", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                    with telemetry_lock:
-                        lat = telemetry_data.get('lat')
-                        lon = telemetry_data.get('lon')
-                        alt = telemetry_data.get('alt')
-                        pitch = telemetry_data.get('pitch')
 
                     if all(v is not None for v in [lat, lon, alt, pitch]):
                         obj_lat, obj_lon = pixel_to_gps(
@@ -184,19 +191,43 @@ def main():
                             lat, lon, alt, pitch,
                             fov_deg=CAMERA_HORIZONTAL_FOV_DEG
                         )
+                        obj_lat_lons.append((obj_lat, obj_lon))
                         gps_str = f"{class_name} at {obj_lat:.6f}, {obj_lon:.6f}"
                         print("[OBJECT DETECTED]", gps_str)
 
-                        detected_objects.append({
-                            'class': class_name,
-                            'confidence': conf,
-                            'latitude': obj_lat,
-                            'longitude': obj_lon,
-                            'timestamp': datetime.now().strftime("%H:%M:%S")
-                        })
-
                         cv2.putText(frame, f"GPS: {obj_lat:.6f}, {obj_lon:.6f}",
                                     (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+                        #detected_objects.append({
+                        #    'class': class_name,
+                        #    'confidence': conf,
+                        #    'latitude': obj_lat,
+                        #    'longitude': obj_lon,
+                        #    'timestamp': datetime.now().strftime("%H:%M:%S")
+                        #})
+
+
+                # Update detected_objects after all boxes in a frame are detected
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                objects = tracker.update(centroids)
+                for idx, centroid in enumerate(centroids):
+                    for id in range(len(objects)-1, 0, -1):
+                        if centroid[0] == objects[id][0] and centroids[1] == objects[id][1]:
+                            if id > len(detected_objects):
+                                detected_objects.append([{
+                                    'id': id,
+                                    'latitude': obj_lat_lons[idx][0],
+                                    'longitude': obj_lat_lons[idx][1],
+                                    'timestamp': timestamp,
+                                    }])
+                            else:
+                                detected_objects[id].append([{
+                                    'id': id,
+                                    'latitude': obj_lat_lons[idx][0],
+                                    'longitude': obj_lat_lons[idx][1],
+                                    'timestamp': timestamp,
+                                    }])
+
 
             with telemetry_lock:
                 lat = telemetry_data.get('lat')
