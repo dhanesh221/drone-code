@@ -3,7 +3,7 @@ from scipy.spatial import distance as dist
 from collections import OrderedDict
 
 class ObjectTracker:
-    def __init__(self, max_disappeared=10):
+    def __init__(self, max_disappeared=5):
         # next_id is the counter for assigning unique IDs
         self.next_id = 0
         # objects stores {id: (centroid_x, centroid_y)}
@@ -77,16 +77,3 @@ class ObjectTracker:
                 self.register(input_centroids[col])
 
         return self.objects
-
-# --- Usage Example ---
-tracker = ObjectTracker(max_disappeared=5)
-
-# Frame 1: One object detected
-frame1_boxes = [[30,30]]
-objects = tracker.update(frame1_boxes) # Returns {0: [30, 30]}
-print(objects)
-
-# Frame 2: Object 0 moved, and a NEW object (1) appears
-frame2_boxes = [[32, 32], [425, 425]]
-objects = tracker.update(frame2_boxes) # Returns {0: [32, 32], 1: [425, 425]}
-print(objects)
