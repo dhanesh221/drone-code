@@ -157,6 +157,12 @@ def main():
             if frame_count % INFERENCE_SKIP == 0:
                 results = model(frame)[0]
 
+                with telemetry_lock:
+                    lat = telemetry_data.get('lat')
+                    lon = telemetry_data.get('lon')
+                    alt = telemetry_data.get('alt')
+                    pitch = telemetry_data.get('pitch')
+
                 for box in results.boxes:
                     conf = float(box.conf[0])
                     if conf < CONFIDENCE_THRESHOLD:
@@ -172,11 +178,6 @@ def main():
                     cv2.putText(frame, f"{class_name} ({conf:.2f})", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-                    with telemetry_lock:
-                        lat = telemetry_data.get('lat')
-                        lon = telemetry_data.get('lon')
-                        alt = telemetry_data.get('alt')
-                        pitch = telemetry_data.get('pitch')
 
                     if all(v is not None for v in [lat, lon, alt, pitch]):
                         obj_lat, obj_lon = pixel_to_gps(
